@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "techspawn.dbsnap",
+  "name": "DB Snapshots",
+  "version": "1.1.0",
+  "author": "Raj Shimpi",
+  "license": "MIT",
+  "description": "One-click snapshots of your projects' local PostgreSQL, MySQL/MariaDB and SQLite databases before a risky migration, and a restore that asks first and saves a safety snapshot. Finds databases in project .env files, running Docker containers and the local PostgreSQL server. Databases on other machines or hosted services are listed but never touched.",
+  "repository": "https://github.com/RajShimpi/omarchy-dbsnap",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "DB Snapshots",
+    "description": "Snapshot and restore local project databases",
+    "category": "Development",
+    "aliases": ["database", "db", "snapshot", "backup", "restore", "postgres", "mysql", "sqlite"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

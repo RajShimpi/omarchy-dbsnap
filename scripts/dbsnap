@@ -1,0 +1,1589 @@
+#!/usr/bin/env python3
+"""Local database snapshots for the DB Snapshots bar widget (techspawn.dbsnap).
+
+  dbsnap list                            JSON: databases found + saved snapshots (read-only)
+  dbsnap snapshot <id> [note]            dump a LOCAL database into a compressed snapshot
+  dbsnap restore <file> --yes            put a snapshot back into its LOCAL database
+                                         (saves a "before restore" safety snapshot first)
+  dbsnap restore <file> --yes --copy     restore into a NEW database instead (auto name)
+  dbsnap restore <file> --yes --into <name>
+  dbsnap delete <file>                   delete one snapshot
+  dbsnap prune <id>                      apply the keep-last-N rule to one database now
+  dbsnap check <url>                     say whether a database URL counts as local (never connects)
+  dbsnap open [id]                       open the snapshot folder in the file manager
+  dbsnap edit                            create the settings file if missing and open it
+
+Only databases on THIS machine are ever dumped or restored: a unix socket or a
+loopback address (127.0.0.0/8, ::1) that is served by a real database server
+process, a local SQLite file, or a container on the local Docker daemon.
+Everything else (hosted services, other machines, SSH tunnels and proxies on a
+local port) is listed read-only. Passwords are never printed.
+"""
+import contextlib, fcntl, glob, gzip, ipaddress, json, os, pwd, re, shutil, socket, sqlite3, stat
+import subprocess, sys, tempfile, threading, time, types, urllib.parse
+
+HOME = os.path.expanduser("~")
+CONF = os.environ.get("DBSNAP_CONFIG") or os.path.join(HOME, ".config/omarchy/dbsnap.json")
+STORE = os.path.realpath(os.environ.get("DBSNAP_STORE") or os.path.join(HOME, ".local/share/omarchy-dbsnap"))
+LOCK = os.path.join(STORE, ".lock")
+RUNNING = os.path.join(STORE, ".running.json")
+GLYPH = "\U000F01BC"  # md-database
+
+DEFAULTS = {
+    "roots": ["~/Projects", "~/projects", "~/Work", "~/work", "~/Code", "~/code", "~/src", "~/dev", "~/repos"],
+    "depth": 4,
+    "envFiles": [".env", ".env.local", ".env.development", ".env.development.local"],
+    "targets": [],
+    "docker": True,
+    "localServers": True,
+    "exclude": [],
+    "keep": 10,
+    "compression": 6,
+    "notify": True,
+    "toolDirs": [],
+}
+
+# Never holds a project's .env, and walking it is what makes discovery slow.
+SKIP_DIRS = {"node_modules", "vendor", "dist", "build", "target", "venv", "__pycache__", "coverage", "bower_components",
+             "public", "static", "assets", "storage", "lib", "test", "tests", "__tests__", "docs", "migrations",
+             "logs", "tmp", "out", "bin", "obj", "pkg", "site-packages", "Pods", "DerivedData", "generated"}
+SNAP_EXT = (".sql.gz", ".sqlite.gz")
+SAFE_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_$.-]{0,62}$")
+SAFE_USER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_$.@-]{0,62}$")
+
+# Hosted database services: never local, no DNS lookup needed to know that.
+PROVIDERS = (".supabase.co", ".supabase.com", ".neon.tech", ".neon.build", ".psdb.cloud", ".planetscale.com",
+             ".amazonaws.com", ".azure.com", ".googleapis.com", ".ondigitalocean.com", ".render.com",
+             ".railway.app", ".rlwy.net", ".aivencloud.com", ".timescale.com", ".cockroachlabs.cloud",
+             ".elephantsql.com", ".heroku.com", ".herokuapp.com", ".fly.dev", ".flycast", ".xata.sh",
+             ".turso.io", ".nhost.run", ".prisma-data.net", ".tidbcloud.com", ".singlestore.com",
+             ".clever-cloud.com", ".scalingo.com", ".koyeb.app", ".vercel-storage.com", ".db.elephantsql.com")
+NETWORK_FS = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "fuse.sshfs", "sshfs", "9p", "davfs", "fuse.davfs2",
+              "fuse.rclone", "ceph", "glusterfs", "fuse.glusterfs", "afs", "lustre", "fuse.s3fs"}
+# Who may answer on a loopback port or socket. Anything else (ssh, kubectl,
+# socat, cloud-sql-proxy, pgbouncer...) could be forwarding to another machine.
+DB_SERVICE_USERS = {"postgres", "postgresql", "pgsql", "_postgres", "mysql", "mariadb", "_mysql"}
+DB_SERVER_COMMS = {"postgres", "postmaster", "mysqld", "mariadbd"}
+CONTAINER_PROXY_COMMS = {"docker-proxy", "rootlessport", "rootlesskit", "slirp4netns", "pasta", "pasta.avx2"}
+DOCKERD_COMMS = {"dockerd", "rootlesskit", "podman", "com.docker.back", "containerd"}
+DB_IMAGES = {"postgres": "postgres", "postgresql": "postgres", "postgis": "postgres", "timescaledb": "postgres",
+             "timescaledb-ha": "postgres", "pgvector": "postgres", "mysql": "mysql", "mysql-server": "mysql",
+             "mariadb": "mysql", "percona-server": "mysql", "percona": "mysql"}
+SCHEMES = {"postgres": "postgres", "postgresql": "postgres", "pgsql": "postgres", "mysql": "mysql", "mysql2": "mysql",
+           "mariadb": "mysql", "sqlite": "sqlite", "sqlite3": "sqlite", "file": "sqlite"}
+TOOLS = {"postgres": (["pg_dump"], ["psql"], "postgresql-libs (pg_dump and psql)"),
+         "mysql": (["mariadb-dump", "mysqldump"], ["mariadb", "mysql"], "mariadb-clients (mariadb-dump and mariadb)")}
+ENGINE_NAMES = {"postgres": "PostgreSQL", "mysql": "MySQL/MariaDB", "sqlite": "SQLite"}
+
+
+class Fail(Exception):
+    pass
+
+
+def tilde(p):
+    return "~" + p[len(HOME):] if p == HOME or p.startswith(HOME + "/") else p
+
+
+def run(argv, env=None, timeout=10, data=None):
+    try:
+        return subprocess.run(argv, env=env, input=data, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(argv, 127, b"", str(e).encode())
+
+
+def last_error(text):
+    lines = [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith(("NOTICE", "HINT", "DETAIL"))]
+    errs = [l for l in lines if "error" in l.lower() or "fatal" in l.lower() or "denied" in l.lower()]
+    line = (errs or lines or ["unknown error"])[0 if errs else -1]
+    return re.sub(r"^(?:pg_dump|psql|mariadb-dump|mysqldump|mariadb|mysql)(?::<stdin>:\d+)?:\s*(?:error:\s*)?", "", line)[:300]
+
+
+# ---------------------------------------------------------------- settings
+
+def settings():
+    s = json.loads(json.dumps(DEFAULTS))
+    s["_error"] = ""
+    try:
+        with open(CONF) as f:
+            user = json.load(f)
+    except FileNotFoundError:
+        user = {}
+    except (OSError, ValueError) as e:
+        user = {}
+        s["_error"] = f"{tilde(CONF)} could not be read ({e}); using the defaults"
+    if isinstance(user, dict):
+        for k, v in user.items():
+            d = DEFAULTS.get(k)
+            if d is None:
+                continue
+            if isinstance(d, bool):
+                ok = isinstance(v, bool)
+            elif isinstance(d, int):
+                ok = isinstance(v, int) and not isinstance(v, bool)
+            else:
+                ok = isinstance(v, type(d))
+            if ok:
+                s[k] = v
+    s["keep"] = max(0, s["keep"])
+    s["depth"] = max(0, min(8, s["depth"]))
+    s["compression"] = max(1, min(9, s["compression"]))
+    return s
+
+
+# ---------------------------------------------------------------- .env parsing
+
+ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
+VAR_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+URL_VAR = re.compile(r"(?:^|_)(?:DATABASE|DB|POSTGRES|POSTGRESQL|PG|MYSQL|MARIADB|SQLITE|DIRECT)(?:_[A-Z0-9]+)*_(?:URL|URI|DSN)$")
+
+
+def parse_env(path):
+    """KEY=value lines -> {key: (value, literal)}; single-quoted values are literal."""
+    out = {}
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = ENV_LINE.match(line)
+            if not m:
+                continue
+            k, v = m.group(1), m.group(2)
+            literal = False
+            if v[:1] in ("'", '"'):
+                end = v.find(v[0], 1)
+                literal = v[0] == "'"
+                v = v[1:end] if end > 0 else v[1:]
+            else:
+                v = re.split(r"\s+#", v, maxsplit=1)[0].strip()
+            out[k] = (v, literal)
+    return out
+
+
+def expand(value, scope, depth=0):
+    if depth > 5:
+        return value
+
+    def sub(m):
+        name = m.group(1) or m.group(3)
+        if name in scope:
+            v, literal = scope[name]
+            return v if literal else expand(v, scope, depth + 1)
+        return m.group(2) if m.group(2) is not None else m.group(0)
+    return VAR_REF.sub(sub, value)
+
+
+def split_hostport(hp):
+    if hp.startswith("["):
+        host, _, rest = hp[1:].partition("]")
+        return host, rest[1:] if rest.startswith(":") else ""
+    if hp.count(":") == 1:
+        host, _, port = hp.partition(":")
+        return host, port
+    return hp, ""
+
+
+def parse_url(url, base):
+    """A database URL -> spec dict, None when it isn't a database URL we handle.
+    Raises ValueError for a database URL we can't make sense of."""
+    url = url.strip()
+    if url.lower().startswith("jdbc:"):
+        url = url[5:]
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*):", url)
+    if not m:
+        return None
+    scheme = m.group(1).lower()
+    eng = SCHEMES.get(scheme.split("+")[0])
+    if not eng:
+        return None
+    if eng == "sqlite":
+        return sqlite_spec(url[len(scheme) + 1:], scheme, base)
+    u = urllib.parse.urlsplit(url)
+    q = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+    userinfo, _, hostport = u.netloc.rpartition("@")
+    user, _, pw = userinfo.partition(":")
+    uq = urllib.parse.unquote
+    spec = {"engine": eng, "user": uq(user) or q.get("user", "") or q.get("username", ""),
+            "password": uq(pw) or q.get("password", ""), "db": uq(u.path.lstrip("/")) or q.get("dbname", "") or q.get("database", ""),
+            "blocked": ""}
+    if "," in hostport:
+        spec["blocked"] = "has several hosts (failover URL); dbsnap only handles one local host"
+        hostport = hostport.split(",")[0]
+    host, port = split_hostport(hostport)
+    if eng == "postgres":
+        # libpq applies query parameters after the authority part, so they win.
+        host = q.get("host") or host
+        port = q.get("port") or port
+        if q.get("hostaddr"):
+            spec["hostaddr"] = q["hostaddr"]
+        if q.get("service"):
+            spec["blocked"] = "uses a pg_service.conf entry, which dbsnap can't check"
+    else:
+        sock = q.get("socket") or q.get("unix_socket") or q.get("socketPath")
+        if sock:
+            spec["socket"] = sock
+    host = uq(host)
+    if "," in host:
+        spec["blocked"] = "has several hosts (failover URL); dbsnap only handles one local host"
+        host = host.split(",")[0]
+    port = str(port).split(",")[0]
+    if port in ("", None):
+        port = 5432 if eng == "postgres" else 3306
+    elif not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError(f"port {port!r} isn't a number")
+    spec["host"], spec["port"] = host if host.startswith("/") else host.lower(), int(port)
+    if not spec["db"] and eng == "postgres":
+        spec["db"] = spec["user"]
+    if not spec["db"]:
+        return None
+    return spec
+
+
+def sqlite_spec(rest, scheme, base):
+    rest = rest.split("?", 1)[0]
+    if rest.startswith("///"):
+        path = rest[2:] if scheme == "file" else rest[3:]
+    elif rest.startswith("//"):
+        path = rest[2:]
+    else:
+        path = rest
+    path = urllib.parse.unquote(path)
+    if not path or path == ":memory:":
+        return None
+    path = os.path.expanduser(path)
+    # Prisma resolves file: URLs next to schema.prisma, usually ./prisma/.
+    cands = [path] if os.path.isabs(path) else [os.path.join(base, "prisma", path), os.path.join(base, path)]
+    for c in cands:
+        c = os.path.realpath(c)
+        if is_sqlite(c):
+            return {"engine": "sqlite", "path": c, "db": os.path.basename(c), "host": "", "port": 0,
+                    "user": "", "password": "", "blocked": ""}
+    return None
+
+
+def is_sqlite(path):
+    try:
+        if not os.path.isfile(path):
+            return False
+        with open(path, "rb") as f:
+            return f.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
+def discrete_specs(env, scope, base):
+    """Laravel-style DB_CONNECTION/DB_HOST/..., PGHOST/PGDATABASE/... and POSTGRES_HOST/... settings."""
+    def val(k):
+        return expand(env[k][0], scope) if k in env and not env[k][1] else (env[k][0] if k in env else "")
+    out = []
+    conn = val("DB_CONNECTION").lower()
+    if conn == "sqlite":
+        p = val("DB_DATABASE") or "database/database.sqlite"
+        sp = sqlite_spec(p if p.startswith("/") else "./" + p, "file", base)
+        if sp:
+            out.append(("DB_CONNECTION", sp))
+    elif conn in ("pgsql", "postgres", "postgresql", "mysql", "mariadb") and val("DB_HOST") and val("DB_DATABASE"):
+        out.append(("DB_HOST", {"engine": "postgres" if conn.startswith(("pg", "postgres")) else "mysql",
+                                "host": val("DB_HOST"), "port": val("DB_PORT"), "db": val("DB_DATABASE"),
+                                "user": val("DB_USERNAME") or val("DB_USER"), "password": val("DB_PASSWORD"), "blocked": ""}))
+    if val("PGHOST") and val("PGDATABASE"):
+        out.append(("PGHOST", {"engine": "postgres", "host": val("PGHOST"), "port": val("PGPORT"), "db": val("PGDATABASE"),
+                               "user": val("PGUSER"), "password": val("PGPASSWORD"), "blocked": ""}))
+    if val("POSTGRES_HOST") and (val("POSTGRES_DB") or val("POSTGRES_DATABASE")):
+        out.append(("POSTGRES_HOST", {"engine": "postgres", "host": val("POSTGRES_HOST"), "port": val("POSTGRES_PORT"),
+                                      "db": val("POSTGRES_DB") or val("POSTGRES_DATABASE"), "user": val("POSTGRES_USER"),
+                                      "password": val("POSTGRES_PASSWORD"), "blocked": ""}))
+    if val("MYSQL_HOST") and val("MYSQL_DATABASE"):
+        out.append(("MYSQL_HOST", {"engine": "mysql", "host": val("MYSQL_HOST"), "port": val("MYSQL_PORT"), "db": val("MYSQL_DATABASE"),
+                                   "user": val("MYSQL_USER"), "password": val("MYSQL_PASSWORD"), "blocked": ""}))
+    for var, sp in out:
+        if sp["engine"] == "sqlite":
+            continue
+        p = str(sp["port"] or ("5432" if sp["engine"] == "postgres" else "3306"))
+        if not p.isdigit() or not 0 < int(p) < 65536:
+            raise ValueError(f"{var}: port {p!r} isn't a number")
+        sp["port"] = int(p)
+        if not sp["host"].startswith("/"):
+            sp["host"] = sp["host"].lower()
+    return out
+
+
+# ---------------------------------------------------------------- the local-only guard
+
+def parse_ip(h):
+    try:
+        return ipaddress.ip_address(h.strip("[]"))
+    except ValueError:
+        return None
+
+
+def is_loopback(ip):
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+def username(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def fs_type(path):
+    best, kind = "", ""
+    try:
+        with open("/proc/self/mounts") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 3:
+                    mnt = p[1].replace("\\040", " ")
+                    if (path == mnt or path.startswith(mnt.rstrip("/") + "/")) and len(mnt) >= len(best):
+                        best, kind = mnt, p[2]
+    except OSError:
+        pass
+    return kind
+
+
+def image_engine(image):
+    last = image.split("@")[0].rsplit("/", 1)[-1]
+    return DB_IMAGES.get(last.split(":")[0].lower(), "")
+
+
+def clean_env(extra=None):
+    """The client tools' environment, minus anything that could redirect them
+    (PGHOSTADDR, PGSERVICE, MYSQL_HOST, DOCKER_HOST, ...)."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("PG", "MYSQL", "MARIADB", "LIBMYSQL", "DOCKER_"))}
+    env.update({"PGCONNECT_TIMEOUT": "5", "PGAPPNAME": "dbsnap"})
+    env.update(extra or {})
+    return env
+
+
+def verify_docker_socket(path, ctx):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False, "Docker isn't running"
+    if not stat.S_ISSOCK(st.st_mode):
+        return False, f"{path} isn't a socket"
+    if st.st_uid == 0:
+        return True, ""
+    if st.st_uid == os.getuid():
+        owner = ctx.socket_process(ctx.unix_inode(path))
+        if owner and owner[1] in DOCKERD_COMMS:
+            return True, ""
+        return False, f"{tilde(path)} isn't served by a Docker daemon dbsnap recognises"
+    return False, f"{tilde(path)} belongs to user '{username(st.st_uid)}'"
+
+
+def docker_endpoint():
+    """Where the docker CLI would connect, worked out the way it does
+    (DOCKER_HOST, then the current context) without running it."""
+    if os.environ.get("DOCKER_HOST"):
+        return os.environ["DOCKER_HOST"]
+    cfg_dir = os.environ.get("DOCKER_CONFIG") or os.path.join(HOME, ".docker")
+    name = os.environ.get("DOCKER_CONTEXT", "")
+    if not name:
+        try:
+            with open(os.path.join(cfg_dir, "config.json")) as f:
+                name = (json.load(f) or {}).get("currentContext") or ""
+        except (OSError, ValueError, AttributeError):
+            name = ""
+    if name and name != "default":
+        import hashlib
+        try:
+            with open(os.path.join(cfg_dir, "contexts", "meta", hashlib.sha256(name.encode()).hexdigest(), "meta.json")) as f:
+                return json.load(f)["Endpoints"]["docker"]["Host"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return f"context '{name}'"
+    return "unix:///var/run/docker.sock"
+
+
+class Docker:
+    """The local Docker daemon, if there is one we can prove is local. Talks
+    to its socket directly for listing (the CLI is slow to start); dumps go
+    through `docker -H unix://... exec`."""
+
+    def __init__(self, enabled, ctx):
+        self.exe = self.ep = None
+        self.reason = ""
+        self._containers = None
+        if not enabled:
+            self.reason = "turned off in settings"
+            return
+        exe = shutil.which("docker")
+        if not exe:
+            self.reason = "docker isn't installed"
+            return
+        ep = docker_endpoint()
+        if not ep.startswith("unix://"):
+            self.reason = f"Docker is set to talk to {ep}, which isn't this machine"
+            return
+        ok, why = verify_docker_socket(ep[7:], ctx)
+        if not ok:
+            self.reason = why
+            return
+        self.exe, self.ep = exe, ep
+
+    def cmd(self, *args):
+        return [self.exe, "-H", self.ep, *args]
+
+    def api(self, path):
+        import http.client
+        sock_path = self.ep[7:]
+
+        class Conn(http.client.HTTPConnection):
+            def connect(self):
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(4)
+                self.sock.connect(sock_path)
+        c = Conn("localhost", timeout=4)
+        try:
+            c.request("GET", path)
+            r = c.getresponse()
+            body = r.read()
+        finally:
+            c.close()
+        if r.status != 200:
+            raise OSError(f"Docker answered {r.status}")
+        return json.loads(body)
+
+    def containers(self):
+        if self._containers is not None:
+            return self._containers
+        self._containers = []
+        if not self.ep:
+            return []
+        try:
+            listing = self.api("/containers/json")
+        except (OSError, ValueError) as e:
+            self.reason = f"Docker isn't reachable ({e})"
+            return []
+        for c in listing if isinstance(listing, list) else []:
+            image = c.get("Image") or ""
+            labels = c.get("Labels") or {}
+            names = {n.lstrip("/") for n in c.get("Names") or []} | {labels.get("com.docker.compose.service", "")}
+            ips, ports, env = set(), {}, {}
+            for net in ((c.get("NetworkSettings") or {}).get("Networks") or {}).values():
+                names.update(net.get("Aliases") or [])
+                names.update(net.get("DNSNames") or [])
+                for k in ("IPAddress", "GlobalIPv6Address"):
+                    ip = parse_ip((net or {}).get(k) or "")
+                    if ip:
+                        ips.add(ip)
+            for pinfo in c.get("Ports") or []:
+                if pinfo.get("PublicPort"):
+                    ports[int(pinfo["PublicPort"])] = int(pinfo.get("PrivatePort") or 0)
+            engine = image_engine(image)
+            if engine:  # the env (database name, user) is only in the full record
+                try:
+                    full = self.api(f"/containers/{c.get('Id', '')}/json")
+                    env = dict(e.split("=", 1) for e in (full.get("Config") or {}).get("Env") or [] if "=" in e)
+                    for net in ((full.get("NetworkSettings") or {}).get("Networks") or {}).values():
+                        names.update(net.get("Aliases") or [])
+                        names.update(net.get("DNSNames") or [])
+                except (OSError, ValueError, AttributeError):
+                    pass
+            name = sorted(n.lstrip("/") for n in c.get("Names") or [""])[0]
+            self._containers.append(types.SimpleNamespace(
+                id=c.get("Id", ""), name=name, image=image, engine=engine, env=env,
+                names={n.lower() for n in names if n}, ips=ips, ports=ports))
+        return self._containers
+
+    def by_name(self, h):
+        return next((c for c in self.containers() if h in c.names), None)
+
+    def by_ip(self, ip):
+        return next((c for c in self.containers() if ip in c.ips), None)
+
+    def by_port(self, port):
+        return next((c for c in self.containers() if port in c.ports), None)
+
+
+class Ctx:
+    """Everything one run learns about this machine: listening sockets, which
+    process owns them, DNS answers, Docker containers."""
+
+    def __init__(self, s):
+        self.s = s
+        self._listeners = None
+        self._unix = None
+        self._procs = None
+        self._dns = {}
+        self.docker = Docker(s["docker"], self)
+
+    def listeners(self):
+        if self._listeners is None:
+            self._listeners = []
+            for fn, fam in (("/proc/net/tcp", 4), ("/proc/net/tcp6", 6)):
+                try:
+                    with open(fn) as f:
+                        lines = f.read().splitlines()[1:]
+                except OSError:
+                    continue
+                for ln in lines:
+                    p = ln.split()
+                    if len(p) < 10 or p[3] != "0A":
+                        continue
+                    a, port = p[1].split(":")
+                    b = bytes.fromhex(a)
+                    ip = ipaddress.IPv4Address(b[::-1]) if fam == 4 else \
+                        ipaddress.IPv6Address(b"".join(b[i:i + 4][::-1] for i in range(0, 16, 4)))
+                    self._listeners.append((ip, int(port, 16), int(p[7]), p[9]))
+        return self._listeners
+
+    def unix_inode(self, path):
+        if self._unix is None:
+            self._unix = {}
+            try:
+                with open("/proc/net/unix") as f:
+                    for ln in f.read().splitlines()[1:]:
+                        p = ln.split(None, 7)
+                        if len(p) == 8 and int(p[3], 16) & 0x10000:  # listening (SO_ACCEPTCON)
+                            self._unix.setdefault(p[7], p[6])
+            except OSError:
+                pass
+        return self._unix.get(path) or self._unix.get(os.path.realpath(path))
+
+    def socket_process(self, inode):
+        """(pid, comm) of the process holding socket `inode`. Only our own
+        processes are visible; database servers and container proxies are
+        looked at first so the common case doesn't walk every process."""
+        if not inode:
+            return None
+        if self._procs is None:
+            self._procs, self._scanned = [], set()
+            for pid in os.listdir("/proc"):
+                if pid.isdigit():
+                    try:
+                        with open(f"/proc/{pid}/comm") as f:
+                            self._procs.append((int(pid), f.read().strip()))
+                    except OSError:
+                        pass
+            self._socks = {}
+        if inode in self._socks:
+            return self._socks[inode]
+        likely = DB_SERVER_COMMS | CONTAINER_PROXY_COMMS | DOCKERD_COMMS
+        for wave in (lambda c: c in likely, lambda c: c not in likely):
+            for pid, comm in self._procs:
+                if pid in self._scanned or not wave(comm):
+                    continue
+                self._scanned.add(pid)
+                try:
+                    fds = os.listdir(f"/proc/{pid}/fd")
+                except OSError:
+                    continue
+                for fd in fds:
+                    try:
+                        link = os.readlink(f"/proc/{pid}/fd/{fd}")
+                    except OSError:
+                        continue
+                    if link.startswith("socket:["):
+                        self._socks.setdefault(link[8:-1], (pid, comm))
+                if inode in self._socks:
+                    return self._socks[inode]
+        return None
+
+    def prefetch(self, hosts):
+        """Resolve several names at once, giving up after 2 s."""
+        todo = [h for h in set(hosts) if h not in self._dns]
+        threads = []
+        for h in todo:
+            def work(h=h):
+                try:
+                    self._dns[h] = sorted({ipaddress.ip_address(ai[4][0].split("%")[0])
+                                           for ai in socket.getaddrinfo(h, None, type=socket.SOCK_STREAM)},
+                                          key=lambda a: a.version)
+                except (OSError, UnicodeError, ValueError):
+                    self._dns[h] = None
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            threads.append(t)
+        deadline = time.time() + 2
+        for t in threads:
+            t.join(max(0, deadline - time.time()))
+
+    def resolve(self, h):
+        if h not in self._dns:
+            self.prefetch([h])
+        return self._dns.get(h)
+
+
+def verdict(local, via="", addr="", reason="", where="", ready=True, container=None):
+    return {"local": local, "via": via, "addr": addr, "reason": reason, "where": where,
+            "listening": ready, "container": container}
+
+
+def remote(reason):
+    return verdict(False, reason=reason, ready=False)
+
+
+def listener_owner_ok(uid, inode, port, ctx):
+    if uid == os.getuid():
+        owner = ctx.socket_process(inode)
+        if not owner:
+            return False, f"can't tell which program serves port {port}"
+        comm = owner[1]
+        if comm in DB_SERVER_COMMS:
+            return True, f"served by {comm}"
+        if comm in CONTAINER_PROXY_COMMS:
+            c = ctx.docker.by_port(port)
+            if c and c.engine:
+                return True, f"published by Docker container {c.name}"
+            return False, f"port {port} is forwarded by {comm} to something that isn't a known local database container"
+        return False, f"port {port} is served by '{comm}', not a database server (a tunnel or proxy can't be verified)"
+    name = username(uid)
+    if name in DB_SERVICE_USERS:
+        return True, f"served by the system {name} service"
+    if uid == 0:
+        c = ctx.docker.by_port(port)
+        if c and c.engine:
+            return True, f"published by Docker container {c.name}"
+        if c:
+            return False, f"port {port} goes to Docker container {c.name} ({c.image}), which isn't a database image"
+        return False, f"port {port} belongs to a root process that isn't a local database container"
+    return False, f"port {port} belongs to user '{name}', not a database service"
+
+
+def check_tcp(addrs, port, ctx, shown):
+    """addrs: loopback IPs the host name stands for. Returns a verdict pinned to one IP."""
+    addrs = sorted(addrs, key=lambda a: a.version)
+    why = ""
+    for ip in addrs:
+        best, rank = None, 9
+        for lip, lport, uid, inode in ctx.listeners():
+            if lport != port:
+                continue
+            mapped = lip.ipv4_mapped if lip.version == 6 else None
+            if lip == ip or mapped == ip:
+                r = 0
+            elif lip.is_unspecified and lip.version == ip.version:
+                r = 1
+            elif lip.is_unspecified and lip.version == 6:
+                r = 2
+            else:
+                continue
+            if r < rank:
+                best, rank = (uid, inode), r
+        if not best:
+            continue
+        ok, why = listener_owner_ok(best[0], best[1], port, ctx)
+        if not ok:
+            return remote(why)
+        c = ctx.docker.by_port(port) if "Docker" in why else None
+        return verdict(True, "tcp", str(ip), why, f"{shown}:{port}", container=c.id if c else None)
+    c = ctx.docker.by_port(port)
+    if c and c.engine:  # published without a userland proxy
+        return verdict(True, "tcp", str(addrs[0]), f"published by Docker container {c.name}", f"{shown}:{port}", container=c.id)
+    return verdict(True, "tcp", str(addrs[0]), f"nothing is listening on {shown}:{port}", f"{shown}:{port}", ready=False)
+
+
+def check_socket(path, ctx):
+    shown = tilde(path)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return verdict(True, "socket", path, f"no server socket at {shown}", f"socket {shown}", ready=False)
+    if not stat.S_ISSOCK(st.st_mode):
+        return remote(f"{shown} isn't a socket")
+    if st.st_uid == os.getuid():
+        owner = ctx.socket_process(ctx.unix_inode(path))
+        if not owner or owner[1] not in DB_SERVER_COMMS:
+            return remote(f"{shown} is served by '{owner[1] if owner else 'an unknown program'}', not a database server")
+        why = f"served by {owner[1]}"
+    else:
+        name = username(st.st_uid)
+        if name not in DB_SERVICE_USERS:
+            return remote(f"{shown} belongs to user '{name}', not a database service")
+        why = f"served by the system {name} service"
+    return verdict(True, "socket", path, why, f"socket {shown}")
+
+
+def pg_socket_path(d, port):
+    return os.path.join(d, f".s.PGSQL.{port}")
+
+
+def default_pg_socket(port):
+    for d in ("/run/postgresql", "/var/run/postgresql", "/tmp"):
+        if os.path.exists(pg_socket_path(d, port)):
+            return d
+    return "/run/postgresql"
+
+
+def docker_verdict(c, eng):
+    if not c.engine:
+        return remote(f"container {c.name} runs {c.image}, which isn't a PostgreSQL/MySQL/MariaDB image")
+    if c.engine != eng:
+        return remote(f"container {c.name} runs {ENGINE_NAMES[c.engine]}, not {ENGINE_NAMES[eng]}")
+    return verdict(True, "docker", c.id, f"local Docker container {c.name}", f"docker container {c.name}", container=c.id)
+
+
+def classify(spec, ctx):
+    """Decide whether `spec` is on this machine. Returns a verdict; only a
+    local one carries an address (a loopback IP, socket path, container id or
+    file) that the client tools are then pinned to."""
+    eng = spec["engine"]
+    if eng == "sqlite":
+        fs = fs_type(spec["path"])
+        if fs in NETWORK_FS:
+            return remote(f"the file is on a network filesystem ({fs})")
+        return verdict(True, "file", spec["path"], "a file on this machine", tilde(spec["path"]))
+    if spec.get("blocked"):
+        return remote(spec["blocked"])
+    port = spec["port"]
+    if eng == "mysql" and spec.get("socket"):
+        return check_socket(spec["socket"], ctx)
+    host = spec.get("hostaddr") or spec.get("host") or ""
+    if not host:
+        if eng == "postgres":
+            d = default_pg_socket(port)
+            v = check_socket(pg_socket_path(d, port), ctx)
+            v["addr"], v["where"] = (d, f"socket {tilde(d)}") if v["local"] else ("", "")
+            return v
+        host = "localhost"
+    if host.startswith("/"):
+        if eng == "postgres":
+            v = check_socket(pg_socket_path(host, port), ctx)
+            v["addr"], v["where"] = (host, f"socket {tilde(host)}") if v["local"] else ("", "")
+            return v
+        return check_socket(host, ctx)
+    h = host.strip().lower().rstrip(".")
+    if any(h == p[1:] or h.endswith(p) for p in PROVIDERS):
+        return remote("a hosted database service")
+    ip = parse_ip(h)
+    if ip is not None:
+        if is_loopback(ip):
+            return check_tcp([ip.ipv4_mapped or ip] if ip.version == 6 and ip.ipv4_mapped else [ip], port, ctx, h)
+        c = ctx.docker.by_ip(ip)
+        if c:
+            return docker_verdict(c, eng)
+        return remote(f"{ip} isn't a loopback address")
+    if h not in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
+        c = ctx.docker.by_name(h)
+        if c:
+            return docker_verdict(c, eng)
+    addrs = ctx.resolve(h)
+    if not addrs:
+        return remote(f"{h} doesn't resolve on this machine")
+    far = [a for a in addrs if not is_loopback(a)]
+    if far:
+        return remote(f"{h} resolves to {far[0]}")
+    return check_tcp(addrs, port, ctx, h)
+
+
+def assert_local(t):
+    """Last check before a client tool runs, on the exact address it gets."""
+    c = t["_conn"]
+    if not t["local"] or not c["local"]:
+        raise Fail(f"{t['id']} is not on this machine ({c['reason']}) — dbsnap never touches it.")
+    via, addr = c["via"], c["addr"]
+    if via == "tcp":
+        ip = parse_ip(addr)
+        if ip is None or not is_loopback(ip):
+            raise Fail("Refusing: not a loopback address")
+    elif via == "socket":
+        p = pg_socket_path(addr, t["port"]) if t["engine"] == "postgres" else addr
+        if not stat.S_ISSOCK(os.stat(p).st_mode):
+            raise Fail("Refusing: not a unix socket")
+    elif via == "docker":
+        if not re.fullmatch(r"[0-9a-f]{12,64}", addr or ""):
+            raise Fail("Refusing: unknown container")
+    elif via != "file":
+        raise Fail("Refusing: unknown connection")
+    if t["engine"] != "sqlite" and not SAFE_NAME.match(t["db"]):
+        raise Fail("Refusing: unusual database name")
+
+
+# ---------------------------------------------------------------- discovery
+
+def env_dirs(s):
+    seen_roots, seen_dirs, names = set(), set(), {}
+    for root in s["roots"]:
+        r = os.path.realpath(os.path.expanduser(root))
+        if r in seen_roots or not os.path.isdir(r):
+            continue
+        seen_roots.add(r)
+        for dirpath, dirnames, filenames in os.walk(r):
+            rel = os.path.relpath(dirpath, r)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS) if depth < s["depth"] else []
+            files = [f for f in s["envFiles"] if f in filenames]
+            if not files:
+                continue
+            real = os.path.realpath(dirpath)
+            if real in seen_dirs:
+                continue
+            seen_dirs.add(real)
+            project = os.path.basename(r) if rel == "." else rel
+            if names.get(project, real) != real:
+                project = os.path.relpath(dirpath, HOME)
+            names[project] = real
+            yield project, dirpath, files
+
+
+def snap_dir(project, db):
+    return os.path.join(STORE, project.replace("/", "__"), db)
+
+
+def discover(s, ctx):
+    """All targets (local and not) plus problems worth showing."""
+    raw, errors = [], []
+    for project, d, files in env_dirs(s):
+        scope = {}
+        for name in files:
+            path = os.path.join(d, name)
+            try:
+                env = parse_env(path)
+            except OSError as e:
+                errors.append(f"{tilde(path)}: {e.strerror}")
+                continue
+            scope.update(env)
+            for var, (value, literal) in env.items():
+                if not URL_VAR.search(var):
+                    continue
+                try:
+                    spec = parse_url(value if literal else expand(value, scope), d)
+                except ValueError as e:
+                    errors.append(f"{tilde(path)}: {var} — {e}")
+                    continue
+                if spec:
+                    raw.append(("env", project, var, spec, path))
+            try:
+                for var, spec in discrete_specs(env, scope, d):
+                    raw.append(("env", project, var, spec, path))
+            except ValueError as e:
+                errors.append(f"{tilde(path)}: {e}")
+    for i, t in enumerate(s["targets"]):
+        try:
+            spec = parse_url(t["url"], HOME) if isinstance(t, dict) and isinstance(t.get("url"), str) else None
+            if not spec:
+                raise ValueError("needs a postgres://, mysql:// or sqlite:// \"url\"")
+            raw.append(("config", str(t.get("name") or "custom"), "dbsnap.json", spec, CONF))
+        except ValueError as e:
+            errors.append(f"{tilde(CONF)}: targets[{i}] — {e}")
+
+    hosts = [sp.get("hostaddr") or sp.get("host") for _, _, _, sp, _ in raw if sp["engine"] != "sqlite"]
+    ctx.prefetch([h.lower() for h in hosts if h and not h.startswith("/") and parse_ip(h) is None
+                  and not any(h.lower().endswith(p) for p in PROVIDERS) and not ctx.docker.by_name(h.lower())])
+
+    out, keys, ids = [], set(), set()
+    for kind, project, var, spec, source in raw:
+        v = classify(spec, ctx)
+        if v["local"]:
+            k = (project, spec["engine"], v["via"], v["container"] or (v["addr"] if v["via"] != "tcp" else ""), spec["port"], spec["db"])
+        else:
+            k = (project, spec["engine"], "remote", spec.get("host"), spec["port"], spec["db"])
+        if k in keys:
+            continue
+        keys.add(k)
+        out.append(make_target(kind, project, var, spec, source, v, ids))
+
+    covered = {(t["engine"], t["_conn"].get("container"), t["db"]) for t in out if t["local"] and t["_conn"].get("container")}
+    if ctx.docker.ep:
+        for c in ctx.docker.containers():
+            if not c.engine:
+                continue
+            if c.engine == "postgres":
+                user = c.env.get("POSTGRES_USER") or "postgres"
+                db = c.env.get("POSTGRES_DB") or user
+            else:
+                user = "root"
+                db = c.env.get("MARIADB_DATABASE") or c.env.get("MYSQL_DATABASE") or ""
+            if not db or (c.engine, c.id, db) in covered:
+                continue
+            spec = {"engine": c.engine, "host": c.name, "port": 5432 if c.engine == "postgres" else 3306,
+                    "db": db, "user": user, "password": "", "container_env": True, "blocked": ""}
+            out.append(make_target("docker", "docker-" + c.name, "container", spec, "", docker_verdict(c, c.engine), ids))
+
+    if s["localServers"]:
+        out += server_targets(ctx, out, ids)
+
+    excl = set(s["exclude"])
+    out = [t for t in out if not ({t["id"], t["db"], t["project"]} & excl)]
+    return out, errors
+
+
+def server_targets(ctx, known, ids):
+    """Databases on a local PostgreSQL server we can reach over its socket
+    as ourselves (peer auth), that no project already points at."""
+    psql = find_tool(["psql"], ctx.s)
+    if not psql:
+        return []
+    out, seen = [], set()
+    for d in ("/run/postgresql", "/var/run/postgresql", "/tmp"):
+        for sock in sorted(glob.glob(os.path.join(d, ".s.PGSQL.*"))):
+            if sock.endswith(".lock") or os.path.realpath(sock) in seen:
+                continue
+            seen.add(os.path.realpath(sock))
+            port = int(sock.rsplit(".", 1)[1])
+            v = check_socket(sock, ctx)
+            if not v["local"] or not v["listening"]:
+                continue
+            v["addr"], v["where"] = d, f"socket {tilde(d)}" + ("" if port == 5432 else f" ({port})")
+            r = run([psql, "-X", "-w", "-A", "-t", "-q", "-h", d, "-p", str(port), "-d", "postgres", "-c",
+                     "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate "
+                     "AND has_database_privilege(datname, 'CONNECT') ORDER BY 1"], env=clean_env(), timeout=4)
+            if r.returncode != 0:
+                continue
+            taken = {t["db"] for t in known if t["local"] and t["engine"] == "postgres" and t["port"] == port}
+            for db in r.stdout.decode(errors="replace").split():
+                if db == "postgres" or db in taken or not SAFE_NAME.match(db):
+                    continue
+                spec = {"engine": "postgres", "host": d, "port": port, "db": db, "user": "", "password": "", "blocked": ""}
+                project = "local-postgres" + ("" if port == 5432 else f"-{port}")
+                out.append(make_target("server", project, "", spec, "", dict(v), ids))
+    return out
+
+
+def make_target(kind, project, var, spec, source, v, ids):
+    eng, db = spec["engine"], spec["db"]
+    local = v["local"]
+    host = spec.get("host") or ("localhost" if eng != "sqlite" else "")
+    tid = f"{project}:{db}" + ("" if local else f"@{host}")
+    if tid in ids:
+        n = 2
+        while f"{tid}~{n}" in ids:
+            n += 1
+        tid = f"{tid}~{n}"
+    ids.add(tid)
+    origin = {"env": f"{var} in {tilde(source)}", "config": tilde(CONF),
+              "docker": "running Docker container", "server": "local PostgreSQL server"}[kind]
+    t = {
+        "id": tid, "project": project, "var": var or kind, "engine": eng,
+        "host": tilde(spec["path"]) if eng == "sqlite" else (tilde(host) if host.startswith("/") else host),
+        "port": spec["port"], "db": db, "user": spec.get("user", ""), "local": local,
+        "source": tilde(source) if source else "", "kind": kind, "via": v["via"], "where": v["where"] or f"{host}:{spec['port']}",
+        "origin": origin, "reason": v["reason"], "ready": False, "problem": "",
+        "dir": snap_dir(project, db), "_spec": spec, "_conn": v,
+    }
+    if local:
+        t["problem"] = readiness(t)
+        t["ready"] = not t["problem"]
+    return t
+
+
+def readiness(t):
+    c = t["_conn"]
+    if not c["listening"]:
+        return c["reason"][:1].upper() + c["reason"][1:] + " — start the database server"
+    if t["engine"] != "sqlite" and not SAFE_NAME.match(t["db"]):
+        return "The database name has characters dbsnap won't pass to the client tools"
+    if t["user"] and not SAFE_USER.match(t["user"]):
+        return "The user name has characters dbsnap won't pass to the client tools"
+    if c["via"] in ("tcp", "socket"):
+        dump, load, pkg = TOOLS[t["engine"]]
+        if not find_tool(dump, SETTINGS) or not find_tool(load, SETTINGS):
+            return f"Install {pkg} to snapshot this database"
+    return ""
+
+
+def find_tool(names, s):
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    dirs = [os.path.expanduser(d) for d in s.get("toolDirs", [])] + sorted(glob.glob(os.path.join(HOME, ".local/share/*/usr/bin")))
+    for d in dirs:
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+    return None
+
+
+def public(t):
+    return {k: v for k, v in t.items() if not k.startswith("_")}
+
+
+def find_target(tid, s, need_ready=True):
+    ctx = Ctx(s)
+    ts, _ = discover(s, ctx)
+    for t in ts:
+        if t["id"] == tid:
+            if not t["local"]:
+                raise Fail(f"{t['db']} ({t['project']}) is not on this machine: {t['reason']}. dbsnap never touches it.")
+            if need_ready and t["problem"]:
+                raise Fail(t["problem"])
+            t["_docker"] = ctx.docker
+            return t
+    raise Fail(f"No local database called {tid} right now (its project's .env or the container may have changed)")
+
+
+# ---------------------------------------------------------------- snapshots on disk
+
+def snap_meta(f):
+    try:
+        with open(f + ".json") as fh:
+            m = json.load(fh)
+            return m if isinstance(m, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def snapshots():
+    out = []
+    files = [f for ext in SNAP_EXT for f in glob.glob(os.path.join(glob.escape(STORE), "*", "*", "*" + ext))]
+    for f in files:
+        project_dir, db = f.split("/")[-3], f.split("/")[-2]
+        name = os.path.basename(f)
+        ext = next(e for e in SNAP_EXT if name.endswith(e))
+        stamp, _, label = name[:-len(ext)].partition("_")
+        m = re.fullmatch(r"(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)", stamp)
+        try:
+            at = int(time.mktime(tuple(int(x) for x in m.groups()) + (0, 0, -1))) if m else int(os.path.getmtime(f))
+        except (ValueError, OverflowError, OSError):
+            at = 0
+        m = snap_meta(f)
+        label = label.replace("-", " ")
+        auto = bool(m.get("auto")) if m else label == "before restore"
+        note = str(m.get("note", "")) if m else ("" if auto else label)
+        try:
+            size = os.path.getsize(f)
+        except OSError:
+            continue
+        out.append({"file": f, "id": project_dir.replace("__", "/") + ":" + db, "at": at,
+                    "label": note or label, "note": note, "auto": auto, "kept": bool(note) and not auto,
+                    "engine": m.get("engine") or ("sqlite" if ext == ".sqlite.gz" else ""), "size": size})
+    out.sort(key=lambda x: (x["at"], x["file"]), reverse=True)
+    return out
+
+
+def snapshot_path(path):
+    p = os.path.realpath(path)
+    if not p.startswith(STORE + os.sep) or not p.endswith(SNAP_EXT) or p.count(os.sep) - STORE.count(os.sep) != 3:
+        raise Fail("Not a dbsnap snapshot file")
+    if not os.path.isfile(p):
+        raise Fail("That snapshot no longer exists")
+    return p
+
+
+def snapshot_engine(path):
+    m = snap_meta(path)
+    if m.get("engine"):
+        return m["engine"]
+    if path.endswith(".sqlite.gz"):
+        return "sqlite"
+    with gzip.open(path, "rb") as f:
+        head = f.read(4096).decode(errors="replace")
+    if "PostgreSQL database dump" in head:
+        return "postgres"
+    if re.search(r"(MySQL|MariaDB) dump", head):
+        return "mysql"
+    return ""
+
+
+def remove_snapshot(f):
+    os.remove(f)
+    with contextlib.suppress(OSError):
+        os.remove(f + ".json")
+
+
+def prune(tid, s):
+    keep = s["keep"]
+    if keep <= 0:
+        return 0
+    mine = [x for x in snapshots() if x["id"] == tid and not x["kept"]]
+    for x in mine[keep:]:
+        remove_snapshot(x["file"])
+    return max(0, len(mine) - keep)
+
+
+@contextlib.contextmanager
+def operation(op, tid, file=""):
+    """One dump/restore/delete at a time across every bar, omnisearch and the CLI."""
+    os.makedirs(STORE, exist_ok=True)
+    lock = open(LOCK, "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        r = running() or {}
+        raise Fail(f"Busy: another {r.get('op', 'dbsnap')} is running ({r.get('id', '')}). Try again when it finishes.")
+    try:
+        with open(RUNNING + ".tmp", "w") as f:
+            json.dump({"op": op, "id": tid, "file": file, "pid": os.getpid(), "started": int(time.time())}, f)
+        os.replace(RUNNING + ".tmp", RUNNING)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(RUNNING)
+        lock.close()
+
+
+def running():
+    try:
+        with open(RUNNING) as f:
+            info = json.load(f)
+        lock = open(LOCK, "a")
+    except (OSError, ValueError):
+        return None
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        return None  # nobody holds the lock: a leftover file
+    except BlockingIOError:
+        return info
+    finally:
+        lock.close()
+
+
+# ---------------------------------------------------------------- client commands
+
+def conn_args(t):
+    """(argv prefix for the host tool or docker exec, env) for dump/load; every
+    path ends at the verified address, never at the original host name."""
+    c, eng, sp = t["_conn"], t["engine"], t["_spec"]
+    user, pw = sp.get("user") or "", sp.get("password") or ""
+    if eng == "postgres":
+        env = clean_env({"PGPASSWORD": pw} if pw else None)
+        a = ["-w", "-h", c["addr"], "-p", str(t["port"])] + (["-U", user] if user else [])
+        return a, env
+    env = clean_env({"MYSQL_PWD": pw} if pw else None)
+    if c["via"] == "socket":
+        a = ["--protocol=SOCKET", "-S", c["addr"]]
+    else:
+        a = ["--protocol=TCP", "-h", c["addr"], "-P", str(t["port"])]
+    return a + ([f"--user={user}"] if user else []), env
+
+
+DOCKER_MYSQL = ('export MYSQL_PWD="${DBSNAP_PW:-${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}}"; '
+                'tool=$(command -v "$1" || command -v "$2") || { echo "$1 is missing in the container" >&2; exit 127; }; '
+                'shift 2; exec "$tool" "$@"')
+
+
+def tool_cmd(t, which, db, extra=()):
+    """argv + env to run the dump ("dump") or the SQL client ("load") against db."""
+    c = t["_conn"]
+    eng = t["engine"]
+    if c["via"] == "docker":
+        d = t.get("_docker")
+        if not d or not d.ep:
+            raise Fail("Docker isn't available")
+        sp = t["_spec"]
+        user, pw = sp.get("user") or ("postgres" if eng == "postgres" else "root"), sp.get("password") or ""
+        # `-e NAME` without a value hands the variable over from docker's own
+        # environment, so the password never appears on a command line.
+        var = "PGPASSWORD" if eng == "postgres" else "DBSNAP_PW"
+        envs, env = (["-e", var], clean_env({var: pw})) if pw else ([], clean_env())
+        if eng == "postgres":
+            prog = "pg_dump" if which == "dump" else "psql"
+            args = ["-X", "-w", "-U", user] + list(extra) + ["-d", db]
+            if which == "dump":
+                args = ["-w", "-U", user, "--clean", "--if-exists", "--no-owner", "--no-privileges", "-d", db]
+            return d.cmd("exec", "-i", *envs, c["addr"], prog, *args), env
+        names = ("mariadb-dump", "mysqldump") if which == "dump" else ("mariadb", "mysql")
+        args = [f"--user={user}"]
+        if which == "dump":
+            args += ["--single-transaction", "--routines", "--triggers", "--add-drop-table", db]
+        else:
+            args += list(extra) + [db]
+        return d.cmd("exec", "-i", *envs, c["addr"], "sh", "-c", DOCKER_MYSQL, "sh", *names, *args), env
+    dump_names, load_names, pkg = TOOLS[eng]
+    exe = find_tool(dump_names if which == "dump" else load_names, SETTINGS)
+    if not exe:
+        raise Fail(f"{(dump_names if which == 'dump' else load_names)[0]} isn't installed — install {pkg}")
+    a, env = conn_args(t)
+    if eng == "postgres":
+        if which == "dump":
+            return [exe, *a, "--clean", "--if-exists", "--no-owner", "--no-privileges", "-d", db], env
+        return [exe, "-X", *a, *extra, "-d", db], env
+    if which == "dump":
+        return [exe, "--no-defaults", *a, "--single-transaction", "--routines", "--triggers", "--add-drop-table", db], env
+    return [exe, "--no-defaults", *a, *extra, db], env
+
+
+def sql(t, db, query, timeout=30):
+    """Run one statement, return stdout text."""
+    if t["engine"] == "postgres":
+        argv, env = tool_cmd(t, "load", db, ["-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-c", query])
+    else:
+        argv, env = tool_cmd(t, "load", db, ["-N", "-B", "-e", query])
+    r = run(argv, env=env, timeout=timeout)
+    if r.returncode != 0:
+        raise Fail(last_error(r.stderr.decode(errors="replace")))
+    return r.stdout.decode(errors="replace")
+
+
+def stream_into(argv, env, chunks):
+    """Feed `chunks` to argv's stdin; stderr goes to a file so a chatty client can't deadlock us."""
+    with tempfile.TemporaryFile() as errf:
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errf, env=env)
+        try:
+            for chunk in chunks:
+                p.stdin.write(chunk)
+        except BrokenPipeError:
+            pass
+        finally:
+            with contextlib.suppress(BrokenPipeError):
+                p.stdin.close()
+        rc = p.wait()
+        errf.seek(0)
+        err = errf.read().decode(errors="replace")
+    if rc != 0:
+        raise Fail(last_error(err))
+    return err
+
+
+def gz_chunks(path):
+    with gzip.open(path, "rb") as src:
+        yield from iter(lambda: src.read(1 << 16), b"")
+
+
+# Drops what the snapshot will bring back plus anything created after it
+# (tables and enums from a newer migration), so the database ends up exactly
+# as snapshotted. Runs inside the restore's single transaction: if anything
+# fails, nothing changes. Leaves extension objects and other owners' objects alone.
+PG_WIPE = r"""
+SET lock_timeout = '15s';
+DO $dbsnap$
+DECLARE q text; stmts text[];
+BEGIN
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog', true);
+  stmts := ARRAY(
+    SELECT pg_catalog.format('DROP %s IF EXISTS %I.%I CASCADE',
+             CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'f' THEN 'FOREIGN TABLE'
+                            WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, n.nspname, c.relname)
+    FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') AND NOT c.relispartition
+      AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\_%'
+      AND pg_catalog.pg_has_role(c.relowner, 'USAGE')
+      AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                      AND d.objid = c.oid AND d.deptype IN ('e', 'a', 'i')))
+  || ARRAY(
+    SELECT pg_catalog.format('DROP ROUTINE IF EXISTS %s CASCADE', p.oid::pg_catalog.regprocedure)
+    FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\_%'
+      AND pg_catalog.pg_has_role(p.proowner, 'USAGE')
+      AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                      AND d.objid = p.oid AND d.deptype IN ('e', 'a', 'i')))
+  || ARRAY(
+    SELECT pg_catalog.format('DROP %s IF EXISTS %I.%I CASCADE', CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END, n.nspname, t.typname)
+    FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+    WHERE (t.typtype IN ('e', 'd', 'r')
+           OR (t.typtype = 'c' AND EXISTS (SELECT 1 FROM pg_catalog.pg_class r WHERE r.oid = t.typrelid AND r.relkind = 'c')))
+      AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\_%'
+      AND pg_catalog.pg_has_role(t.typowner, 'USAGE')
+      AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
+                      AND d.objid = t.oid AND d.deptype IN ('e', 'a', 'i')));
+  FOREACH q IN ARRAY stmts LOOP
+    EXECUTE q;
+  END LOOP;
+END
+$dbsnap$;
+"""
+
+
+def mysql_wipe(t, db):
+    rows = sql(t, db, "SELECT table_type, table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
+    out = ["SET FOREIGN_KEY_CHECKS=0;"]
+    for line in rows.splitlines():
+        kind, _, name = line.partition("\t")
+        if name:
+            out.append(f"DROP {'VIEW' if kind == 'VIEW' else 'TABLE'} IF EXISTS `{name.replace('`', '``')}`;")
+    return ("\n".join(out) + "\n").encode()
+
+
+def load(t, snap, db, wipe):
+    eng = t["engine"]
+    if eng == "sqlite":
+        return sqlite_load(snap, db)
+    if eng == "postgres":
+        argv, env = tool_cmd(t, "load", db, ["-q", "-v", "ON_ERROR_STOP=1", "--single-transaction"])
+        pre = PG_WIPE.encode() if wipe else b"SET lock_timeout = '15s';\n"
+    else:
+        argv, env = tool_cmd(t, "load", db)
+        pre = mysql_wipe(t, db) if wipe else b""
+
+    def chunks():
+        yield pre
+        yield from gz_chunks(snap)
+    err = stream_into(argv, env, chunks())
+    return len([l for l in err.splitlines() if ("WARNING" in l or "ERROR" in l) and not l.startswith("WARNING: option")])
+
+
+def do_snapshot(t, s, note="", auto=False):
+    assert_local(t)
+    d = t["dir"]
+    os.makedirs(d, exist_ok=True)
+    for part in glob.glob(os.path.join(glob.escape(d), "*.part*")):  # we hold the lock: leftovers of a killed run
+        with contextlib.suppress(OSError):
+            os.remove(part)
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", note).strip("-")[:40]
+    ext = ".sqlite.gz" if t["engine"] == "sqlite" else ".sql.gz"
+    while True:
+        path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + (("_" + slug) if slug else "") + ext)
+        if not os.path.exists(path) and not os.path.exists(path + ".json"):
+            break
+        time.sleep(1.05 - time.time() % 1)
+    tmp = path + ".part"
+    try:
+        if t["engine"] == "sqlite":
+            sqlite_dump(t["_conn"]["addr"], tmp, s["compression"])
+        else:
+            argv, env = tool_cmd(t, "dump", t["db"])
+            with tempfile.TemporaryFile() as errf, gzip.open(tmp, "wb", compresslevel=s["compression"]) as out:
+                p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errf, env=env)
+                total = 0
+                for chunk in iter(lambda: p.stdout.read(1 << 16), b""):
+                    out.write(chunk)
+                    total += len(chunk)
+                rc = p.wait()
+                if rc != 0 or total == 0:
+                    errf.seek(0)
+                    raise Fail("Dump failed: " + last_error(errf.read().decode(errors="replace")))
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+    meta = {"id": t["id"], "project": t["project"], "db": t["db"], "engine": t["engine"], "where": t["where"],
+            "note": "" if auto else note.strip()[:200], "auto": auto, "created": int(time.time())}
+    with open(path + ".json", "w") as f:
+        json.dump(meta, f)
+    return path
+
+
+def sqlite_dump(src_path, out_path, level):
+    raw = out_path + ".db"
+    try:
+        src = sqlite3.connect(f"file:{urllib.parse.quote(src_path)}?mode=ro", uri=True, timeout=15)
+        dst = sqlite3.connect(raw)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        with open(raw, "rb") as fi, gzip.open(out_path, "wb", compresslevel=level) as fo:
+            shutil.copyfileobj(fi, fo, 1 << 16)
+    except sqlite3.Error as e:
+        raise Fail(f"SQLite backup failed: {e}")
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(raw)
+
+
+def sqlite_load(snap, dest):
+    fd, raw = tempfile.mkstemp(dir=STORE, suffix=".restore.db")
+    os.close(fd)
+    try:
+        with gzip.open(snap, "rb") as fi, open(raw, "wb") as fo:
+            shutil.copyfileobj(fi, fo, 1 << 16)
+        src = sqlite3.connect(f"file:{urllib.parse.quote(raw)}?mode=ro", uri=True)
+        dst = sqlite3.connect(dest, timeout=15)
+        src.backup(dst)  # page-by-page under SQLite's own locking
+        dst.close()
+        src.close()
+    except sqlite3.Error as e:
+        raise Fail(f"SQLite restore failed: {e}")
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(raw)
+    return 0
+
+
+# ---------------------------------------------------------------- notifications
+
+def notify(title, body="", urgent=False):
+    if not SETTINGS["notify"]:
+        return
+    if os.environ.get("OMARCHY_NO_NOTIFY") == "1":
+        print(f"[notify{' urgent' if urgent else ''}] {title} — {body}", file=sys.stderr)
+        return
+    argv = ["omarchy-notification-send", "-g", GLYPH] + (["-u", "critical"] if urgent else []) + [title, body]
+    with contextlib.suppress(OSError):
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def mb(n):
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{max(1, round(n / 1024))} KB"
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_list():
+    s = SETTINGS
+    ctx = Ctx(s)
+    ts, errors = discover(s, ctx)
+    if s["_error"]:
+        errors.insert(0, s["_error"])
+    snaps = snapshots()
+    by = {}
+    for x in snaps:
+        by.setdefault(x["id"], []).append(x)
+    out = []
+    for t in ts:
+        mine = by.get(t["id"], [])
+        p = public(t)
+        p.update({"count": len(mine), "bytes": sum(x["size"] for x in mine), "last": mine[0]["at"] if mine else 0})
+        out.append(p)
+    print(json.dumps({"targets": out, "snapshots": snaps, "store": STORE, "config": CONF, "keep": s["keep"],
+                      "running": running(), "errors": errors,
+                      "docker": {"ok": bool(ctx.docker.ep), "reason": ctx.docker.reason}}))
+
+
+def cmd_snapshot(tid, note=""):
+    try:
+        t = find_target(tid, SETTINGS)
+        with operation("snapshot", t["id"]):
+            path = do_snapshot(t, SETTINGS, note)
+            pruned = prune(t["id"], SETTINGS)
+    except Fail as e:
+        notify(f"Snapshot of {tid.split(':', 1)[-1]} failed", str(e), urgent=True)
+        raise
+    size = os.path.getsize(path)
+    notify(f"Snapshot saved: {t['db']}", f"{t['project']} · {mb(size)}")
+    print(json.dumps({"ok": True, "file": path, "size": size, "pruned": pruned}))
+
+
+def cmd_restore(path, yes, copy, into):
+    path = snapshot_path(path)
+    tid = path.split(os.sep)[-3].replace("__", "/") + ":" + path.split(os.sep)[-2]
+    t = find_target(tid, SETTINGS)
+    eng = snapshot_engine(path)
+    if eng != t["engine"]:
+        raise Fail(f"This snapshot is {ENGINE_NAMES.get(eng, 'of an unknown kind')}, but {t['db']} is {ENGINE_NAMES[t['engine']]}")
+    if not yes:
+        what = f"into a new database next to {t['db']}" if copy else f"over {t['db']} ({t['where']})"
+        raise Fail(f"This restores {os.path.basename(path)} {what}. Run again with --yes to do it.")
+    assert_local(t)
+    with operation("restore", t["id"], path):
+        if copy:
+            if into and not SAFE_NAME.match(into):
+                raise Fail("Pick a new name made of letters, digits, _ . - (starting with a letter or digit)")
+            if t["engine"] == "sqlite":
+                base, ext = os.path.splitext(t["_conn"]["addr"])
+                dest = os.path.join(os.path.dirname(base), into) if into else f"{base}-restored-{time.strftime('%m%d-%H%M%S')}{ext or '.db'}"
+                if os.path.exists(dest):
+                    raise Fail(f"{tilde(dest)} already exists")
+                load(t, path, dest, wipe=False)
+                shown = tilde(dest)
+            else:
+                name = (into or f"{t['db']}_restored_{time.strftime('%m%d_%H%M%S')}")[:63]
+                if not SAFE_NAME.match(name) or name == t["db"]:
+                    raise Fail("Pick a new database name made of letters, digits and _ (not the current one)")
+                q = f'CREATE DATABASE "{name}"' if t["engine"] == "postgres" else f"CREATE DATABASE `{name}`"
+                sql(t, t["db"], q)
+                try:
+                    load(t, path, name, wipe=False)
+                except Fail:
+                    with contextlib.suppress(Fail):
+                        sql(t, t["db"], f'DROP DATABASE "{name}"' if t["engine"] == "postgres" else f"DROP DATABASE `{name}`")
+                    raise
+                shown = name
+            notify(f"Restored into {shown}", f"{os.path.basename(path)} · {t['db']} was not changed")
+            print(json.dumps({"ok": True, "into": shown, "warnings": 0}))
+            return
+        safety = do_snapshot(t, SETTINGS, "before restore", auto=True)
+        try:
+            if t["engine"] == "sqlite":
+                warnings = load(t, path, t["_conn"]["addr"], wipe=True)
+            else:
+                warnings = load(t, path, t["db"], wipe=True)
+        except Fail as e:
+            why = str(e)
+            if "lock timeout" in why or "database is locked" in why or "Lock wait timeout" in why:
+                why = "the database is in use (an app is holding a lock); stop your dev server and try again"
+            msg = f"Restore failed: {why}. " + ("Nothing was changed." if t["engine"] in ("postgres", "sqlite")
+                                              else "Your data from before is in the 'before restore' snapshot.")
+            notify(f"Restore of {t['db']} failed", msg, urgent=True)
+            raise Fail(msg)
+    notify(f"Restored {t['db']}", os.path.basename(path) + (f" · {warnings} warnings" if warnings else ""))
+    print(json.dumps({"ok": True, "warnings": warnings, "safety": safety}))
+
+
+def cmd_delete(path):
+    path = snapshot_path(path)
+    with operation("delete", "", path):
+        remove_snapshot(path)
+        for d in (os.path.dirname(path), os.path.dirname(os.path.dirname(path))):
+            with contextlib.suppress(OSError):
+                os.rmdir(d)  # only if now empty
+    print(json.dumps({"ok": True}))
+
+
+def cmd_prune(tid):
+    with operation("prune", tid):
+        n = prune(tid, SETTINGS)
+    print(json.dumps({"ok": True, "pruned": n}))
+
+
+def cmd_check(url):
+    try:
+        spec = parse_url(url, os.getcwd())
+    except ValueError as e:
+        raise Fail(str(e))
+    if not spec:
+        raise Fail("Not a postgres://, mysql:// or sqlite:// URL (or the SQLite file doesn't exist)")
+    v = classify(spec, Ctx(SETTINGS))
+    print(json.dumps({"engine": spec["engine"], "host": spec.get("host") or spec.get("path"), "port": spec["port"],
+                      "db": spec["db"], "local": v["local"], "via": v["via"], "where": v["where"],
+                      "reason": v["reason"], "listening": v["listening"] if v["local"] else False}))
+
+
+def cmd_open(tid=""):
+    d = STORE
+    if tid:
+        for x in snapshots():
+            if x["id"] == tid:
+                d = os.path.dirname(x["file"])
+                break
+    os.makedirs(d, exist_ok=True)
+    subprocess.Popen(["xdg-open", d], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    print(json.dumps({"ok": True, "dir": d}))
+
+
+def cmd_edit():
+    if not os.path.exists(CONF):
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        with open(CONF, "w") as f:
+            json.dump(DEFAULTS, f, indent=2)
+            f.write("\n")
+    editor = shutil.which("omarchy-launch-editor")
+    os.execvp(editor or "xdg-open", [editor or "xdg-open", CONF])
+
+
+SETTINGS = DEFAULTS
+
+
+def main(a):
+    global SETTINGS
+    SETTINGS = settings()
+    cmd = a[0] if a else ""
+    if cmd == "list" and len(a) == 1:
+        return cmd_list()
+    if cmd == "snapshot" and len(a) >= 2:
+        return cmd_snapshot(a[1], " ".join(a[2:]))
+    if cmd == "restore" and len(a) >= 2:
+        flags, into = a[2:], ""
+        if "--into" in flags:
+            i = flags.index("--into")
+            if i + 1 >= len(flags):
+                raise Fail("--into needs a name")
+            into = flags[i + 1]
+            del flags[i:i + 2]
+        unknown = [f for f in flags if f not in ("--yes", "--copy")]
+        if unknown:
+            raise Fail("Unknown option " + unknown[0])
+        return cmd_restore(a[1], "--yes" in flags, "--copy" in flags or bool(into), into)
+    if cmd == "delete" and len(a) == 2:
+        return cmd_delete(a[1])
+    if cmd == "prune" and len(a) == 2:
+        return cmd_prune(a[1])
+    if cmd == "check" and len(a) == 2:
+        return cmd_check(a[1])
+    if cmd == "open" and len(a) <= 2:
+        return cmd_open(a[1] if len(a) == 2 else "")
+    if cmd == "edit" and len(a) == 1:
+        return cmd_edit()
+    print(__doc__, file=sys.stderr)
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except Fail as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
+    except Exception as e:  # never leave the panel without an answer
+        import traceback
+        traceback.print_exc()
+        print(json.dumps({"error": f"dbsnap hit an internal error: {type(e).__name__}: {e}"}))
+        sys.exit(1)
