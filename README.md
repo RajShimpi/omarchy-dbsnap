@@ -192,7 +192,9 @@ A database's id is `<project>:<database>`. The project is its folder relative
 to the root, for example `shop/api:shop_dev`. Snapshots are saved in
 `~/.local/share/omarchy-dbsnap/<project>/<database>/` as
 `YYYYMMDD-HHMMSS[_note].sql.gz` (`.sqlite.gz` for SQLite) with a small `.json`
-file next to each one that holds the note.
+file next to each one that holds the note. A snapshot is a full copy of the
+database, so the folders are `0700` and the files `0600`: only you can read
+them. A store made by an older version is tightened the next time it runs.
 
 ## Dependencies
 

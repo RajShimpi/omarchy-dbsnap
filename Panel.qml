@@ -262,12 +262,13 @@ Panel {
             id: hero
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(14)
-            Text { text: root.glyph("db"); color: root.fg; font.family: root.font; font.pixelSize: Style.font.display; anchors.verticalCenter: parent.verticalCenter }
+            Text { textFormat: Text.PlainText; text: root.glyph("db"); color: root.fg; font.family: root.font; font.pixelSize: Style.font.display; anchors.verticalCenter: parent.verticalCenter }
             Column {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
-              Text { text: "DB Snapshots"; color: root.fg; font.family: root.font; font.pixelSize: Style.font.title; font.bold: true }
+              Text { textFormat: Text.PlainText; text: "DB Snapshots"; color: root.fg; font.family: root.font; font.pixelSize: Style.font.title; font.bold: true }
               Text {
+                textFormat: Text.PlainText
                 text: (root.localTargets.length + " local databases · " + root.snaps.length + " snapshots"
                        + (root.snaps.length ? " · " + root.size(root.totalBytes) : "")).toUpperCase()
                 color: Qt.darker(root.fg, 1.4); font.family: root.font; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1.2
@@ -318,11 +319,13 @@ Panel {
           spacing: Style.space(8)
           Text {
             id: spinner
+            textFormat: Text.PlainText
             text: root.glyph("spin"); color: Commons.Color.accent; font.family: root.font; font.pixelSize: Style.font.bodySmall
             transformOrigin: Item.Center
             RotationAnimation on rotation { from: 0; to: 360; duration: 900; loops: Animation.Infinite; running: root.working && root.opened }
           }
           Text {
+            textFormat: Text.PlainText
             width: parent.width - spinner.width - parent.spacing
             text: root.runningText
             color: Commons.Color.accent; font.family: root.font; font.pixelSize: Style.font.bodySmall
@@ -331,6 +334,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           visible: root.status !== ""
           width: parent.width
           wrapMode: Text.Wrap
@@ -354,6 +358,7 @@ Panel {
             spacing: Style.space(8)
 
             Text {
+              textFormat: Text.PlainText
               visible: !root.loaded && root.status === ""
               text: "Looking for databases…"
               color: root.dim; font.family: root.font; font.pixelSize: Style.font.bodySmall
@@ -404,12 +409,14 @@ Panel {
                           anchors.verticalCenter: parent.verticalCenter
                           spacing: Style.space(1)
                           Text {
+                            textFormat: Text.PlainText
                             width: parent.width
                             text: root.kindGlyph(card.t) + "  " + card.t.db + "   ·   " + card.t.project
                             color: root.fg; font.family: root.font; font.pixelSize: Style.font.bodySmall; font.bold: true
                             elide: Text.ElideRight
                           }
                           Text {
+                            textFormat: Text.PlainText
                             width: parent.width
                             text: root.engineName(card.t.engine) + " · " + card.t.where + " · " + card.t.origin
                             color: root.dim; font.family: root.font; font.pixelSize: Style.font.caption
@@ -433,6 +440,7 @@ Panel {
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         visible: card.t.problem !== ""
                         width: parent.width
                         wrapMode: Text.Wrap
@@ -441,6 +449,7 @@ Panel {
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         visible: card.mine.length === 0 && card.t.problem === ""
                         text: "No snapshots yet"
                         color: Qt.darker(root.fg, 1.8); font.family: root.font; font.pixelSize: Style.font.caption
@@ -459,6 +468,7 @@ Panel {
 
                           Text {
                             id: snapText
+                            textFormat: Text.PlainText
                             anchors.left: parent.left
                             anchors.right: snapActions.left
                             anchors.rightMargin: Style.space(6)
@@ -523,6 +533,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.loaded && root.localTargets.length === 0
               width: listCol.width
               wrapMode: Text.Wrap
@@ -538,6 +549,7 @@ Panel {
               spacing: Style.space(4)
               PanelSectionHeader { text: "SNAPSHOTS WITHOUT A DATABASE RIGHT NOW"; foreground: root.fg; fontFamily: root.font }
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 wrapMode: Text.Wrap
                 text: "Their project, setting or container isn't found at the moment, so they can't be restored until it is back. You can still delete them."
@@ -553,6 +565,7 @@ Panel {
                   implicitHeight: Math.max(orphanText.implicitHeight, orphanDel.implicitHeight)
                   Text {
                     id: orphanText
+                    textFormat: Text.PlainText
                     anchors.left: parent.left
                     anchors.right: orphanDel.left
                     anchors.rightMargin: Style.space(6)
@@ -594,6 +607,7 @@ Panel {
             Repeater {
               model: root.showRemote ? root.remoteTargets : []
               delegate: Text {
+                textFormat: Text.PlainText
                 required property var modelData
                 width: listCol.width
                 wrapMode: Text.Wrap
@@ -618,6 +632,7 @@ Panel {
             Repeater {
               model: root.showErrors ? root.listErrors : []
               delegate: Text {
+                textFormat: Text.PlainText
                 required property var modelData
                 width: listCol.width
                 wrapMode: Text.Wrap
@@ -627,6 +642,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: listCol.width
               horizontalAlignment: Text.AlignHCenter
               wrapMode: Text.Wrap

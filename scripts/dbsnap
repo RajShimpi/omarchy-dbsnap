@@ -1542,8 +1542,21 @@ def cmd_edit():
 SETTINGS = DEFAULTS
 
 
+def private_store():
+    """A snapshot is a full copy of a database, so everything this script writes is
+    for this user only. Also tightens a store written by an older version."""
+    os.umask(0o077)
+    for root, dirs, files in os.walk(STORE):
+        for p, mode in [(root, 0o700)] + [(os.path.join(root, f), 0o600) for f in files]:
+            with contextlib.suppress(OSError):
+                st = os.lstat(p)
+                if not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o077:
+                    os.chmod(p, mode)
+
+
 def main(a):
     global SETTINGS
+    private_store()
     SETTINGS = settings()
     cmd = a[0] if a else ""
     if cmd == "list" and len(a) == 1:
